@@ -24,6 +24,7 @@ Validate boards → evaluate predicted boards → explore highest‑eval boards 
 ## Research
 - Reinforcement learning to improve performance (ideas/approaches)
 	- Fine‑tune with self‑play using a policy/value loss (AlphaZero‑style)
+     - [alphaGo](https://www.youtube.com/watch?v=4PyWLgrt7YY&t=21s)
 - Serving the model on Lichess from a VM (useful docs)
 	- Lichess Bot API: https://lichess.org/api#tag/Bot
 	- Lichess bot reference: https://github.com/lichess-bot-devs/lichess-bot

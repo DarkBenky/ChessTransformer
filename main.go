@@ -40,14 +40,6 @@ const (
 	blackKing
 	whiteToMove
 	blackToMove
-)
-
-type ProcessedData struct {
-	X      []byte
-	Y      []byte
-	Player string
-	Move   string
-	Eval   float64
 }
 
 func initDB() error {
@@ -75,76 +67,9 @@ func initDB() error {
 	return err
 }
 
-func worker(id int) {
-	for data := range dataChan {
-		// Tokenize boards
-		xTokens := fenToTokens(data.X)
-		yTokens := fenToTokens(data.Y)
-
-		// Analyze position to get best move and evaluation
-		evalResult, err := analyzePosition(data.X, 8)
-		if err != nil {
-			log.Printf("Worker %d: Failed to analyze position: %v", id, err)
-			continue
-		}
-
-		// Apply best move to get predicted FEN
-		predictedFen, err := applyMove(data.X, evalResult.BestMove)
-		if err != nil {
-			log.Printf("Worker %d: Failed to apply move: %v", id, err)
-			continue
-		}
-
-		// Tokenize predicted board
-		yPredictedTokens := fenToTokens(predictedFen)
-
-		// Insert original move (human played)
-		processedChan <- ProcessedData{
-			X:      xTokens,
-			Y:      yTokens,
-			Player: data.Player,
-			Move:   data.Move,
-			Eval:   evalResult.Eval,
-		}
-
-		// Insert predicted move (Stockfish best)
-		processedChan <- ProcessedData{
-			X:      xTokens,
-			Y:      yPredictedTokens,
-			Player: "stockfish",
-			Move:   evalResult.BestMove,
-			Eval:   evalResult.Eval,
-		}
-	}
-}
-
-func dbWriter() {
-	stmt, err := db.Prepare("INSERT INTO board_data (x_board, y_board, player, move, eval) VALUES (?, ?, ?, ?, ?)")
-	if err != nil {
-		log.Fatal("Failed to prepare statement:", err)
-	}
-	defer stmt.Close()
-
-	count := 0
-	for data := range processedChan {
-		_, err := stmt.Exec(data.X, data.Y, data.Player, data.Move, data.Eval)
-		if err != nil {
-			log.Printf("Failed to insert data: %v", err)
-		} else {
-			count++
-			if count%100 == 0 {
-				log.Printf("DB: Inserted %d rows", count)
-			}
-		}
-	}
-}
-
 var (
-	db            *sql.DB
-	dbWriteMu     sync.Mutex
-	dataChan      chan BoardData
-	processedChan chan ProcessedData
-	numWorkers    = 24
+	db        *sql.DB
+	dbWriteMu sync.Mutex
 )
 
 func fenToTokens(fen string) []byte {
@@ -187,29 +112,6 @@ func fenToTokens(fen string) []byte {
 	}
 
 	return tokens
-}
-
-type TokenizedBoardData struct {
-	X    [64]uint8 `json:"X"`
-	Y    [64]uint8 `json:"Y"`
-	Move string    `json:"move"`
-}
-
-func tokenizeFen(board BoardData) TokenizedBoardData {
-	var tokenizedX [64]uint8
-	var tokenizedY [64]uint8
-
-	// Tokenize X and Y using the piece mapping
-	for i := range 64 {
-		tokenizedX[i] = pieceToToken(board.X[i])
-		tokenizedY[i] = pieceToToken(board.Y[i])
-	}
-
-	return TokenizedBoardData{
-		X:    tokenizedX,
-		Y:    tokenizedY,
-		Move: board.Move,
-	}
 }
 
 func pieceToToken(piece byte) uint8 {
@@ -419,7 +321,7 @@ func postBoardHandler(c echo.Context) error {
 	xTokens := fenToTokens(data.X)
 	yTokens := fenToTokens(data.Y)
 
-	evalResult, err := analyzePosition(data.X, 4)
+	evalResult, err := analyzePosition(data.X, 8)
 	if err != nil {
 		log.Printf("Failed to analyze: %v", err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "analysis failed"})

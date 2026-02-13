@@ -1,7 +1,9 @@
 import tensorflow as tf
 from tensorflow import keras
 from io import StringIO
+from io import BytesIO
 import os
+from datetime import datetime
 from tensorflow.keras.layers import (
     Dense,
     Dropout,
@@ -16,12 +18,128 @@ import numpy as np
 import requests
 import wandb
 
+try:
+    import chess
+
+    CHESS_AVAILABLE = True
+except Exception:
+    CHESS_AVAILABLE = False
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+try:
+    import cairosvg
+
+    CAIROSVG_AVAILABLE = True
+except Exception:
+    CAIROSVG_AVAILABLE = False
+
 STEPS = 1_000_000_000_000
 BATCH_SIZE = 32
 API_URL = "http://localhost:1323/getData"
 NUM_TOKENS = 15
 SEQ_LEN = 65
 MODEL_DIM = 64
+NUM_HEADS = 4
+FF_DIM = 256
+NUM_TRANSFORMER_BLOCKS = 4
+DROPOUT_RATE = 0.2
+SELF_PLAY_GIF_EVERY_STEPS = 100
+SELF_PLAY_PLIES = 30
+SELF_PLAY_TEMPERATURE = 0.75
+SELF_PLAY_TOP_K = 4
+INITIAL_LR = 5e-4
+LR_REDUCE_PATIENCE_STEPS = 1000
+LR_REDUCE_FACTOR = 0.9
+LEGAL_LOSS_WEIGHT = 0.2
+EVAL_PERSPECTIVE = "white"  # "white" or "side_to_move"
+RESUME_FROM_BEST_CHECKPOINT = True
+BEST_EVAL_CKPT_PATH = "checkpoints/best_eval_model.keras"
+BEST_NEXT_CKPT_PATH = "checkpoints/best_next_board_model.keras"
+
+EMPTY_SQUARE = 0
+WHITE_PAWN = 1
+WHITE_KNIGHT = 2
+WHITE_BISHOP = 3
+WHITE_ROOK = 4
+WHITE_QUEEN = 5
+WHITE_KING = 6
+BLACK_PAWN = 7
+BLACK_KNIGHT = 8
+BLACK_BISHOP = 9
+BLACK_ROOK = 10
+BLACK_QUEEN = 11
+BLACK_KING = 12
+WHITE_TO_MOVE = 13
+BLACK_TO_MOVE = 14
+
+TOKEN_TO_CHESS_PIECE = {
+    WHITE_PAWN: chess.Piece(chess.PAWN, chess.WHITE) if CHESS_AVAILABLE else None,
+    WHITE_KNIGHT: chess.Piece(chess.KNIGHT, chess.WHITE) if CHESS_AVAILABLE else None,
+    WHITE_BISHOP: chess.Piece(chess.BISHOP, chess.WHITE) if CHESS_AVAILABLE else None,
+    WHITE_ROOK: chess.Piece(chess.ROOK, chess.WHITE) if CHESS_AVAILABLE else None,
+    WHITE_QUEEN: chess.Piece(chess.QUEEN, chess.WHITE) if CHESS_AVAILABLE else None,
+    WHITE_KING: chess.Piece(chess.KING, chess.WHITE) if CHESS_AVAILABLE else None,
+    BLACK_PAWN: chess.Piece(chess.PAWN, chess.BLACK) if CHESS_AVAILABLE else None,
+    BLACK_KNIGHT: chess.Piece(chess.KNIGHT, chess.BLACK) if CHESS_AVAILABLE else None,
+    BLACK_BISHOP: chess.Piece(chess.BISHOP, chess.BLACK) if CHESS_AVAILABLE else None,
+    BLACK_ROOK: chess.Piece(chess.ROOK, chess.BLACK) if CHESS_AVAILABLE else None,
+    BLACK_QUEEN: chess.Piece(chess.QUEEN, chess.BLACK) if CHESS_AVAILABLE else None,
+    BLACK_KING: chess.Piece(chess.KING, chess.BLACK) if CHESS_AVAILABLE else None,
+}
+
+CHESS_PIECE_TO_TOKEN = {
+    "P": WHITE_PAWN,
+    "N": WHITE_KNIGHT,
+    "B": WHITE_BISHOP,
+    "R": WHITE_ROOK,
+    "Q": WHITE_QUEEN,
+    "K": WHITE_KING,
+    "p": BLACK_PAWN,
+    "n": BLACK_KNIGHT,
+    "b": BLACK_BISHOP,
+    "r": BLACK_ROOK,
+    "q": BLACK_QUEEN,
+    "k": BLACK_KING,
+}
+
+PIECE_TO_GLYPH = {
+    EMPTY_SQUARE: "",
+    WHITE_PAWN: "P",
+    WHITE_KNIGHT: "N",
+    WHITE_BISHOP: "B",
+    WHITE_ROOK: "R",
+    WHITE_QUEEN: "Q",
+    WHITE_KING: "K",
+    BLACK_PAWN: "p",
+    BLACK_KNIGHT: "n",
+    BLACK_BISHOP: "b",
+    BLACK_ROOK: "r",
+    BLACK_QUEEN: "q",
+    BLACK_KING: "k",
+}
+
+PIECE_TO_ASSET = {
+    WHITE_PAWN: "pawn-w.svg",
+    WHITE_KNIGHT: "knight-w.svg",
+    WHITE_BISHOP: "bishop-w.svg",
+    WHITE_ROOK: "rook-w.svg",
+    WHITE_QUEEN: "queen-w.svg",
+    WHITE_KING: "king-w.svg",
+    BLACK_PAWN: "pawn-b.svg",
+    BLACK_KNIGHT: "knight-b.svg",
+    BLACK_BISHOP: "bishop-b.svg",
+    BLACK_ROOK: "rook-b.svg",
+    BLACK_QUEEN: "queen-b.svg",
+    BLACK_KING: "king-b.svg",
+}
+
+_PIECE_IMAGE_CACHE: dict[tuple[int, int], "Image.Image"] = {}
 
 
 def transformer_block(x, heads=4, ff_dim=128, dropout=0.1):
@@ -44,24 +162,18 @@ def build_eval_model() -> keras.Model:
     pos_emb = Embedding(input_dim=SEQ_LEN, output_dim=MODEL_DIM)(pos_ids)
     x = tok_emb + pos_emb
 
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
+    for _ in range(NUM_TRANSFORMER_BLOCKS):
+        x = transformer_block(x, heads=NUM_HEADS, ff_dim=FF_DIM, dropout=DROPOUT_RATE)
+
+    x = LayerNormalization(epsilon=1e-6)(x)
 
     x = GlobalAveragePooling1D()(x)
-    x = Dense(128, activation="relu")(x)
-    x = Dropout(0.1)(x)
+    x = Dense(64, activation="relu")(x)
+    x = Dropout(DROPOUT_RATE)(x)
     out = Dense(1, name="eval_out")(x)
     model = keras.Model(inp, out, name="eval_model")
     model.compile(
-        optimizer=keras.optimizers.Adam(1e-4),
+        optimizer=keras.optimizers.Adam(INITIAL_LR),
         loss=keras.losses.MeanSquaredError(),
         metrics=[keras.metrics.MeanAbsoluteError(name="mae")],
     )
@@ -76,20 +188,176 @@ def build_next_board_model() -> keras.Model:
     pos_emb = Embedding(input_dim=SEQ_LEN, output_dim=MODEL_DIM)(pos_ids)
     x = tok_emb + pos_emb
 
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
-    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
+    for _ in range(NUM_TRANSFORMER_BLOCKS):
+        x = transformer_block(x, heads=NUM_HEADS, ff_dim=FF_DIM, dropout=DROPOUT_RATE)
+
+    x = LayerNormalization(epsilon=1e-6)(x)
 
     out = Dense(NUM_TOKENS, name="next_board_logits")(x)
     model = keras.Model(inp, out, name="next_board_model")
     model.compile(
-        optimizer=keras.optimizers.Adam(1e-4),
+        optimizer=keras.optimizers.Adam(INITIAL_LR),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="token_acc")],
     )
     return model
+
+
+def _token_index_to_square(idx: int) -> "int":
+    # token idx 1..64 corresponds to board squares a8..h1
+    r = (idx - 1) // 8
+    c = (idx - 1) % 8
+    return chess.square(c, 7 - r)
+
+
+def _tokens_to_chess_board(board_tokens: np.ndarray) -> "chess.Board | None":
+    if not CHESS_AVAILABLE or board_tokens.shape != (65,):
+        return None
+
+    try:
+        board = chess.Board(None)
+        board.clear_board()
+        board.turn = chess.WHITE if int(board_tokens[0]) == WHITE_TO_MOVE else chess.BLACK
+        board.castling_rights = chess.BB_EMPTY
+        board.ep_square = None
+        board.halfmove_clock = 0
+        board.fullmove_number = 1
+
+        for i in range(1, 65):
+            token = int(board_tokens[i])
+            if token == EMPTY_SQUARE:
+                continue
+            piece = TOKEN_TO_CHESS_PIECE.get(token)
+            if piece is None:
+                return None
+            board.set_piece_at(_token_index_to_square(i), piece)
+
+        return board
+    except Exception:
+        return None
+
+
+def _chess_board_to_tokens(board: "chess.Board") -> np.ndarray:
+    tokens = np.zeros((65,), dtype=np.int32)
+    tokens[0] = WHITE_TO_MOVE if board.turn == chess.WHITE else BLACK_TO_MOVE
+    for i in range(1, 65):
+        piece = board.piece_at(_token_index_to_square(i))
+        tokens[i] = CHESS_PIECE_TO_TOKEN.get(piece.symbol(), EMPTY_SQUARE) if piece else EMPTY_SQUARE
+    return tokens
+
+
+def _score_candidate_tokens_from_logits(logits: np.ndarray, candidate_tokens: np.ndarray) -> float:
+    selected = candidate_tokens.astype(np.int64)
+    stable_logits = logits - np.max(logits, axis=-1, keepdims=True)
+    log_probs = stable_logits - np.log(np.sum(np.exp(stable_logits), axis=-1, keepdims=True) + 1e-12)
+    return float(np.sum(log_probs[np.arange(SEQ_LEN), selected]))
+
+
+def _build_legal_token_mask_for_board(board_tokens: np.ndarray) -> np.ndarray:
+    """
+    Build a per-position legal-token mask from python-chess legal moves.
+    mask[pos, token] = 1 if token appears at `pos` in at least one legal next board.
+    """
+    mask = np.zeros((SEQ_LEN, NUM_TOKENS), dtype=np.float32)
+
+    if not CHESS_AVAILABLE:
+        # Fallback: allow all piece/empty tokens on squares + both turn tokens.
+        mask[0, WHITE_TO_MOVE] = 1.0
+        mask[0, BLACK_TO_MOVE] = 1.0
+        mask[1:, : BLACK_KING + 1] = 1.0
+        return mask
+
+    board = _tokens_to_chess_board(board_tokens)
+    if board is None:
+        mask[0, WHITE_TO_MOVE] = 1.0
+        mask[0, BLACK_TO_MOVE] = 1.0
+        mask[1:, : BLACK_KING + 1] = 1.0
+        return mask
+
+    legal_moves = list(board.legal_moves)
+    if len(legal_moves) == 0:
+        # Terminal board: only current tokens are possible.
+        mask[np.arange(SEQ_LEN), board_tokens.astype(np.int64)] = 1.0
+        return mask
+
+    for mv in legal_moves:
+        b = board.copy(stack=False)
+        b.push(mv)
+        nxt = _chess_board_to_tokens(b)
+        mask[np.arange(SEQ_LEN), nxt.astype(np.int64)] = 1.0
+
+    return mask
+
+
+def _build_legal_token_mask_batch(x_batch: np.ndarray) -> np.ndarray:
+    masks = np.zeros((x_batch.shape[0], SEQ_LEN, NUM_TOKENS), dtype=np.float32)
+    for i in range(x_batch.shape[0]):
+        masks[i] = _build_legal_token_mask_for_board(x_batch[i])
+    return masks
+
+
+def train_next_board_step(
+    next_board_model: keras.Model,
+    x_in: np.ndarray,
+    y_board_batch: np.ndarray,
+) -> dict:
+    if not CHESS_AVAILABLE:
+        return next_board_model.train_on_batch(x_in, y_board_batch, return_dict=True)
+
+    legal_mask_np = _build_legal_token_mask_batch(x_in)
+    legal_mask = tf.convert_to_tensor(legal_mask_np, dtype=tf.float32)
+
+    with tf.GradientTape() as tape:
+        logits = next_board_model(x_in, training=True)
+
+        ce = tf.keras.losses.sparse_categorical_crossentropy(y_board_batch, logits, from_logits=True)
+        ce_loss = tf.reduce_mean(ce)
+
+        probs = tf.nn.softmax(logits, axis=-1)
+        legal_mass = tf.reduce_sum(probs * legal_mask, axis=-1)
+        legal_mass_loss = -tf.reduce_mean(tf.math.log(legal_mass + 1e-8))
+
+        loss = ce_loss + LEGAL_LOSS_WEIGHT * legal_mass_loss
+
+    grads = tape.gradient(loss, next_board_model.trainable_variables)
+    next_board_model.optimizer.apply_gradients(zip(grads, next_board_model.trainable_variables))
+
+    token_acc = tf.reduce_mean(tf.keras.metrics.sparse_categorical_accuracy(y_board_batch, logits))
+
+    return {
+        "loss": float(loss.numpy()),
+        "token_acc": float(token_acc.numpy()),
+        "ce_loss": float(ce_loss.numpy()),
+        "legal_mass_loss": float(legal_mass_loss.numpy()),
+    }
+
+
+def _predict_next_board_fallback(logits: np.ndarray, board_tokens: np.ndarray) -> np.ndarray:
+    next_tokens = np.zeros((SEQ_LEN,), dtype=np.int32)
+    next_tokens[0] = BLACK_TO_MOVE if int(board_tokens[0]) == WHITE_TO_MOVE else WHITE_TO_MOVE
+
+    for i in range(1, SEQ_LEN):
+        square_logits = logits[i, : BLACK_KING + 1].astype(np.float64)
+        temp = max(1e-6, SELF_PLAY_TEMPERATURE)
+        square_logits = square_logits / temp
+
+        if SELF_PLAY_TOP_K > 0 and SELF_PLAY_TOP_K < square_logits.shape[0]:
+            topk_idx = np.argpartition(square_logits, -SELF_PLAY_TOP_K)[-SELF_PLAY_TOP_K:]
+            filtered = np.full_like(square_logits, -1e9)
+            filtered[topk_idx] = square_logits[topk_idx]
+            square_logits = filtered
+
+        square_logits = square_logits - np.max(square_logits)
+        probs = np.exp(square_logits)
+        probs_sum = probs.sum()
+        if probs_sum <= 0:
+            next_tokens[i] = int(np.argmax(logits[i, : BLACK_KING + 1]))
+        else:
+            probs = probs / probs_sum
+            next_tokens[i] = int(np.random.choice(np.arange(BLACK_KING + 1), p=probs))
+
+    next_tokens[1:] = np.clip(next_tokens[1:], 0, BLACK_KING)
+    return next_tokens
 
 
 def fetch_batch(batch_size: int):
@@ -101,9 +369,16 @@ def fetch_batch(batch_size: int):
             resp = requests.get(API_URL, timeout=10)
             resp.raise_for_status()
             parsed = parse_board_response(resp.json())
-            x_batch.append(parsed["X"].astype(np.int32))
+            x_tokens = parsed["X"].astype(np.int32)
+            x_batch.append(x_tokens)
             y_board_batch.append(parsed["Y"].astype(np.int32))
-            y_eval_batch.append(np.float32(parsed["eval"]))
+            eval_value = float(parsed["eval"])
+
+            # Stockfish score is side-to-move perspective. Convert to white perspective if configured.
+            if EVAL_PERSPECTIVE == "white" and int(x_tokens[0]) == BLACK_TO_MOVE:
+                eval_value = -eval_value
+
+            y_eval_batch.append(np.float32(eval_value))
         except Exception:
             failures += 1
             if failures > batch_size * 5:
@@ -124,14 +399,258 @@ def get_model_summary_text(model: keras.Model) -> str:
     return buf.getvalue()
 
 
+def _get_optimizer_lr(optimizer: keras.optimizers.Optimizer) -> float:
+    lr = optimizer.learning_rate
+    try:
+        return float(tf.keras.backend.get_value(lr))
+    except Exception:
+        return float(lr)
+
+
+def _set_optimizer_lr(optimizer: keras.optimizers.Optimizer, new_lr: float) -> None:
+    lr = optimizer.learning_rate
+    try:
+        tf.keras.backend.set_value(lr, new_lr)
+    except Exception:
+        optimizer.learning_rate = new_lr
+
+
+def _try_resume_from_best_checkpoint(model: keras.Model, checkpoint_path: str, model_name: str) -> bool:
+    if not RESUME_FROM_BEST_CHECKPOINT:
+        return False
+    if not os.path.exists(checkpoint_path):
+        print(f"No checkpoint found for {model_name} at {checkpoint_path}")
+        return False
+
+    try:
+        loaded = keras.models.load_model(checkpoint_path, compile=False)
+        model.set_weights(loaded.get_weights())
+        print(f"Resumed {model_name} weights from {checkpoint_path}")
+        return True
+    except Exception as e:
+        print(f"Failed to resume {model_name} from {checkpoint_path}: {e}")
+        return False
+
+
+def _default_start_board_tokens() -> np.ndarray:
+    board = np.zeros((65,), dtype=np.int32)
+    board[0] = WHITE_TO_MOVE
+    board[1:9] = np.array(
+        [BLACK_ROOK, BLACK_KNIGHT, BLACK_BISHOP, BLACK_QUEEN, BLACK_KING, BLACK_BISHOP, BLACK_KNIGHT, BLACK_ROOK],
+        dtype=np.int32,
+    )
+    board[9:17] = BLACK_PAWN
+    board[49:57] = WHITE_PAWN
+    board[57:65] = np.array(
+        [WHITE_ROOK, WHITE_KNIGHT, WHITE_BISHOP, WHITE_QUEEN, WHITE_KING, WHITE_BISHOP, WHITE_KNIGHT, WHITE_ROOK],
+        dtype=np.int32,
+    )
+    return board
+
+
+def _predict_next_board(next_board_model: keras.Model, board_tokens: np.ndarray) -> np.ndarray:
+    # Monte Carlo dropout + legal-move constrained decoding via python-chess
+    logits = next_board_model(board_tokens[None, :], training=True).numpy()[0]
+    if CHESS_AVAILABLE:
+        board = _tokens_to_chess_board(board_tokens)
+        if board is not None:
+            legal_moves = list(board.legal_moves)
+            if len(legal_moves) == 0:
+                return board_tokens.copy()
+
+            candidates: list[np.ndarray] = []
+            scores: list[float] = []
+            for mv in legal_moves:
+                b = board.copy(stack=False)
+                b.push(mv)
+                candidate = _chess_board_to_tokens(b)
+                candidates.append(candidate)
+                scores.append(_score_candidate_tokens_from_logits(logits, candidate))
+
+            scores_np = np.array(scores, dtype=np.float64)
+            temp = max(1e-6, SELF_PLAY_TEMPERATURE)
+            scores_np = scores_np / temp
+
+            if SELF_PLAY_TOP_K > 0 and SELF_PLAY_TOP_K < scores_np.shape[0]:
+                topk_idx = np.argpartition(scores_np, -SELF_PLAY_TOP_K)[-SELF_PLAY_TOP_K:]
+                filtered = np.full_like(scores_np, -1e9)
+                filtered[topk_idx] = scores_np[topk_idx]
+                scores_np = filtered
+
+            scores_np = scores_np - np.max(scores_np)
+            probs = np.exp(scores_np)
+            probs_sum = probs.sum()
+            if probs_sum <= 0:
+                choice = int(np.argmax(scores_np))
+            else:
+                probs = probs / probs_sum
+                choice = int(np.random.choice(np.arange(len(candidates)), p=probs))
+
+            return candidates[choice]
+
+    return _predict_next_board_fallback(logits, board_tokens)
+
+
+def _render_board_frame(board_tokens: np.ndarray, ply: int, eval_score: float) -> "Image.Image":
+    cell = 64
+    header_h = 56
+    board_px = cell * 8
+    img = Image.new("RGB", (board_px, board_px + header_h), color=(20, 20, 20))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+
+    light = (240, 217, 181)
+    dark = (181, 136, 99)
+    white_piece = (245, 245, 245)
+    black_piece = (35, 35, 35)
+
+    side_txt = "white" if int(board_tokens[0]) == WHITE_TO_MOVE else "black"
+    draw.text((8, 8), f"Self-play | ply {ply} | to move: {side_txt} | eval: {eval_score:.3f}", fill=(255, 255, 255), font=font)
+
+    squares = board_tokens[1:65].reshape(8, 8)
+
+    def _load_piece_image(token: int, target_px: int) -> "Image.Image | None":
+        if not PIL_AVAILABLE:
+            return None
+        key = (token, target_px)
+        if key in _PIECE_IMAGE_CACHE:
+            return _PIECE_IMAGE_CACHE[key]
+
+        asset_name = PIECE_TO_ASSET.get(token)
+        if not asset_name:
+            return None
+
+        asset_path = os.path.join("assets", asset_name)
+        if not os.path.exists(asset_path):
+            return None
+
+        try:
+            if not CAIROSVG_AVAILABLE:
+                return None
+
+            png_bytes = cairosvg.svg2png(url=asset_path)
+            img = Image.open(BytesIO(png_bytes)).convert("RGBA")
+
+            # Fit into cell with margin while preserving aspect ratio.
+            max_side = max(1, int(target_px * 0.82))
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            _PIECE_IMAGE_CACHE[key] = img
+            return img
+        except Exception:
+            return None
+
+    for r in range(8):
+        for c in range(8):
+            x0 = c * cell
+            y0 = header_h + r * cell
+            x1 = x0 + cell
+            y1 = y0 + cell
+            draw.rectangle([x0, y0, x1, y1], fill=light if (r + c) % 2 == 0 else dark)
+
+            token = int(squares[r, c])
+            piece_img = _load_piece_image(token, cell)
+            if piece_img is not None:
+                px = x0 + (cell - piece_img.width) // 2
+                py = y0 + (cell - piece_img.height) // 2
+                img.paste(piece_img, (px, py), piece_img)
+            else:
+                glyph = PIECE_TO_GLYPH.get(token, "?")
+                if glyph:
+                    fill = white_piece if token <= WHITE_KING else black_piece
+                    draw.text((x0 + cell // 2 - 4, y0 + cell // 2 - 6), glyph, fill=fill, font=font)
+
+    return img
+
+
+def create_and_log_self_play_gif(
+    next_board_model: keras.Model,
+    eval_model: keras.Model,
+    step: int,
+    seed_board: np.ndarray | None = None,
+) -> None:
+    try:
+        if not PIL_AVAILABLE:
+            wandb.log({"self_play/gif_skipped": 1}, step=step)
+            return
+
+        os.makedirs("artifacts/self_play", exist_ok=True)
+
+        current = (
+            seed_board.astype(np.int32).copy()
+            if seed_board is not None and seed_board.shape == (65,)
+            else _default_start_board_tokens()
+        )
+
+        frames = []
+        evals = []
+        for ply in range(SELF_PLAY_PLIES + 1):
+            ev = float(eval_model.predict(current[None, :], verbose=0)[0][0])
+            evals.append(ev)
+            frames.append(_render_board_frame(current, ply=ply, eval_score=ev))
+            if ply < SELF_PLAY_PLIES:
+                current = _predict_next_board(next_board_model, current)
+
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        gif_path = f"artifacts/self_play/self_play_step_{step}_{ts}.gif"
+        frames[0].save(
+            gif_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=800,
+            loop=0,
+            optimize=False,
+        )
+
+        wandb.log(
+            {
+                "self_play/gif": wandb.Video(gif_path, format="gif"),
+                "self_play/start_eval": float(evals[0]),
+                "self_play/end_eval": float(evals[-1]),
+            },
+            step=step,
+        )
+    except Exception as e:
+        print(f"Step {step}: failed to create/log self-play GIF: {e}")
+        wandb.log({"self_play/gif_skipped": 1}, step=step)
+
+
 if __name__ == "__main__":
     wandb.init(
         project="chess-transformer",
-        config={"steps": STEPS, "batch_size": BATCH_SIZE, "lr": 1e-4},
+        config={
+            "steps": STEPS,
+            "batch_size": BATCH_SIZE,
+            "lr": INITIAL_LR,
+            "eval_perspective": EVAL_PERSPECTIVE,
+            "model_dim": MODEL_DIM,
+            "num_heads": NUM_HEADS,
+            "ff_dim": FF_DIM,
+            "num_transformer_blocks": NUM_TRANSFORMER_BLOCKS,
+            "dropout_rate": DROPOUT_RATE,
+            "self_play_temperature": SELF_PLAY_TEMPERATURE,
+            "self_play_top_k": SELF_PLAY_TOP_K,
+            "legal_loss_weight": LEGAL_LOSS_WEIGHT,
+            "lr_reduce_patience_steps": LR_REDUCE_PATIENCE_STEPS,
+            "lr_reduce_factor": LR_REDUCE_FACTOR,
+        },
     )
 
     eval_model = build_eval_model()
     next_board_model = build_next_board_model()
+
+    eval_resumed = _try_resume_from_best_checkpoint(
+        model=eval_model,
+        checkpoint_path=BEST_EVAL_CKPT_PATH,
+        model_name="eval_model",
+    )
+    next_resumed = _try_resume_from_best_checkpoint(
+        model=next_board_model,
+        checkpoint_path=BEST_NEXT_CKPT_PATH,
+        model_name="next_board_model",
+    )
+
+    wandb.run.summary["resumed_eval_model"] = bool(eval_resumed)
+    wandb.run.summary["resumed_next_board_model"] = bool(next_resumed)
 
     eval_model.summary()
     next_board_model.summary()
@@ -153,6 +672,7 @@ if __name__ == "__main__":
     os.makedirs("checkpoints", exist_ok=True)
     best_eval_loss = float("inf")
     best_next_loss = float("inf")
+    last_improvement_step = 0
 
     for step in range(STEPS):
         x_batch, y_board_batch, y_eval_batch = fetch_batch(BATCH_SIZE)
@@ -162,8 +682,16 @@ if __name__ == "__main__":
 
         x_in = x_batch
 
+        changed_counts = np.sum(x_batch[:, 1:] != y_board_batch[:, 1:], axis=1)
+        avg_changed_squares = float(np.mean(changed_counts))
+        min_changed_squares = int(np.min(changed_counts))
+        max_changed_squares = int(np.max(changed_counts))
+        eval_target_mean = float(np.mean(y_eval_batch))
+        eval_target_min = float(np.min(y_eval_batch))
+        eval_target_max = float(np.max(y_eval_batch))
+
         eval_metrics = eval_model.train_on_batch(x_in, y_eval_batch, return_dict=True)
-        next_metrics = next_board_model.train_on_batch(x_in, y_board_batch, return_dict=True)
+        next_metrics = train_next_board_step(next_board_model, x_in, y_board_batch)
 
         wandb.log(
             {
@@ -172,23 +700,77 @@ if __name__ == "__main__":
                 "eval/mae": float(eval_metrics["mae"]),
                 "next_board/loss": float(next_metrics["loss"]),
                 "next_board/token_acc": float(next_metrics["token_acc"]),
+                "next_board/ce_loss": float(next_metrics.get("ce_loss", next_metrics["loss"])),
+                "next_board/legal_mass_loss": float(next_metrics.get("legal_mass_loss", 0.0)),
+                "data/eval_target_mean": eval_target_mean,
+                "data/eval_target_min": eval_target_min,
+                "data/eval_target_max": eval_target_max,
+                "data/avg_changed_squares": avg_changed_squares,
+                "data/min_changed_squares": min_changed_squares,
+                "data/max_changed_squares": max_changed_squares,
                 "batch_size": int(x_batch.shape[0]),
             },
             step=step + 1,
         )
 
+        if (step + 1) % SELF_PLAY_GIF_EVERY_STEPS == 0:
+            seed_board = x_batch[0] if x_batch.shape[0] > 0 else None
+            create_and_log_self_play_gif(
+                next_board_model=next_board_model,
+                eval_model=eval_model,
+                step=step + 1,
+                seed_board=seed_board,
+            )
+
         # Save best checkpoints
+        improved = False
         if float(eval_metrics["loss"]) < best_eval_loss:
             best_eval_loss = float(eval_metrics["loss"])
             eval_model.save("checkpoints/best_eval_model.keras")
             wandb.run.summary["best_eval_loss"] = best_eval_loss
             wandb.run.summary["best_eval_step"] = step + 1
+            improved = True
 
         if float(next_metrics["loss"]) < best_next_loss:
             best_next_loss = float(next_metrics["loss"])
             next_board_model.save("checkpoints/best_next_board_model.keras")
             wandb.run.summary["best_next_board_loss"] = best_next_loss
             wandb.run.summary["best_next_board_step"] = step + 1
+            improved = True
+
+        if improved:
+            last_improvement_step = step + 1
+
+        if (step + 1) - last_improvement_step >= LR_REDUCE_PATIENCE_STEPS:
+            eval_lr = _get_optimizer_lr(eval_model.optimizer)
+            next_lr = _get_optimizer_lr(next_board_model.optimizer)
+            new_eval_lr = eval_lr * LR_REDUCE_FACTOR
+            new_next_lr = next_lr * LR_REDUCE_FACTOR
+            _set_optimizer_lr(eval_model.optimizer, new_eval_lr)
+            _set_optimizer_lr(next_board_model.optimizer, new_next_lr)
+            last_improvement_step = step + 1
+
+            wandb.log(
+                {
+                    "lr/eval": new_eval_lr,
+                    "lr/next_board": new_next_lr,
+                    "lr/reduced_on_plateau": 1,
+                },
+                step=step + 1,
+            )
+            print(
+                f"Step {step + 1}: no improvement for {LR_REDUCE_PATIENCE_STEPS} steps, "
+                f"reduced learning rates by 10% -> eval_lr={new_eval_lr:.8f}, next_lr={new_next_lr:.8f}"
+            )
+        else:
+            wandb.log(
+                {
+                    "lr/eval": _get_optimizer_lr(eval_model.optimizer),
+                    "lr/next_board": _get_optimizer_lr(next_board_model.optimizer),
+                    "lr/reduced_on_plateau": 0,
+                },
+                step=step + 1,
+            )
 
         print(
             f"Step {step + 1}/{STEPS} | "

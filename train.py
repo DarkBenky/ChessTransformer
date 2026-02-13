@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow import keras
 from io import StringIO
+import os
 from tensorflow.keras.layers import (
     Dense,
     Dropout,
@@ -15,7 +16,7 @@ import numpy as np
 import requests
 import wandb
 
-STEPS = 10_000
+STEPS = 1_000_000_000_000
 BATCH_SIZE = 32
 API_URL = "http://localhost:1323/getData"
 NUM_TOKENS = 15
@@ -43,6 +44,11 @@ def build_eval_model() -> keras.Model:
     pos_emb = Embedding(input_dim=SEQ_LEN, output_dim=MODEL_DIM)(pos_ids)
     x = tok_emb + pos_emb
 
+    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
+    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
+    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
+    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
+    x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
     x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
     x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
     x = transformer_block(x, heads=8, ff_dim=512, dropout=0.1)
@@ -144,6 +150,10 @@ if __name__ == "__main__":
     wandb.run.summary["eval_model_params"] = int(eval_model.count_params())
     wandb.run.summary["next_board_model_params"] = int(next_board_model.count_params())
 
+    os.makedirs("checkpoints", exist_ok=True)
+    best_eval_loss = float("inf")
+    best_next_loss = float("inf")
+
     for step in range(STEPS):
         x_batch, y_board_batch, y_eval_batch = fetch_batch(BATCH_SIZE)
         if x_batch is None:
@@ -166,6 +176,19 @@ if __name__ == "__main__":
             },
             step=step + 1,
         )
+
+        # Save best checkpoints
+        if float(eval_metrics["loss"]) < best_eval_loss:
+            best_eval_loss = float(eval_metrics["loss"])
+            eval_model.save("checkpoints/best_eval_model.keras")
+            wandb.run.summary["best_eval_loss"] = best_eval_loss
+            wandb.run.summary["best_eval_step"] = step + 1
+
+        if float(next_metrics["loss"]) < best_next_loss:
+            best_next_loss = float(next_metrics["loss"])
+            next_board_model.save("checkpoints/best_next_board_model.keras")
+            wandb.run.summary["best_next_board_loss"] = best_next_loss
+            wandb.run.summary["best_next_board_step"] = step + 1
 
         print(
             f"Step {step + 1}/{STEPS} | "

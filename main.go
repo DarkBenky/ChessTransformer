@@ -40,7 +40,7 @@ const (
 	blackKing
 	whiteToMove
 	blackToMove
-}
+)
 
 func initDB() error {
 	var err error
@@ -151,6 +151,20 @@ type EvalResult struct {
 	Mate     *int    `json:"mate,omitempty"`
 }
 
+func mateToEval(mateIn int) float64 {
+	// Map mate score to strong bounded eval (in pawns).
+	// Example: mate in n -> sign * (10 + 1/(|n|+1)).
+	absN := mateIn
+	if absN < 0 {
+		absN = -absN
+	}
+	base := 10.0 + 1.0/float64(absN+1)
+	if mateIn < 0 {
+		return -base
+	}
+	return base
+}
+
 func analyzePosition(fen string, depth int) (*EvalResult, error) {
 	cmd := exec.Command("stockfish")
 	stdin, err := cmd.StdinPipe()
@@ -208,7 +222,7 @@ func analyzePosition(fen string, depth int) (*EvalResult, error) {
 						// Mate in X moves
 						if val, err := strconv.Atoi(scoreValue); err == nil {
 							mate = &val
-							eval = 0
+							eval = mateToEval(val)
 						}
 					}
 				}
@@ -321,7 +335,7 @@ func postBoardHandler(c echo.Context) error {
 	xTokens := fenToTokens(data.X)
 	yTokens := fenToTokens(data.Y)
 
-	evalResult, err := analyzePosition(data.X, 8)
+	evalResult, err := analyzePosition(data.X, 11)
 	if err != nil {
 		log.Printf("Failed to analyze: %v", err)
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "analysis failed"})

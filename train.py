@@ -3,8 +3,14 @@ from tensorflow import keras
 from io import StringIO
 from io import BytesIO
 import os
+import shutil
 from datetime import datetime
 from tensorflow.keras.layers import (
+    Activation,
+    Add,
+    BatchNormalization,
+    Concatenate,
+    Conv1D,
     Dense,
     Dropout,
     Input,
@@ -12,11 +18,15 @@ from tensorflow.keras.layers import (
     MultiHeadAttention,
     Embedding,
     GlobalAveragePooling1D,
+    GlobalMaxPooling1D,
 )
 from dataHelper import parse_board_response
 import numpy as np
 import requests
 import wandb
+
+# Prevent TensorFlow from pre-allocating all GPU memory.
+os.environ.setdefault("TF_FORCE_GPU_ALLOW_GROWTH", "true")
 
 try:
     import chess
@@ -50,17 +60,37 @@ FF_DIM = 256
 NUM_TRANSFORMER_BLOCKS = 4
 DROPOUT_RATE = 0.2
 SELF_PLAY_GIF_EVERY_STEPS = 100
-SELF_PLAY_PLIES = 30
-SELF_PLAY_TEMPERATURE = 0.75
+SELF_PLAY_PLIES = 60  # 30 moves per side
+SELF_PLAY_ALWAYS_FROM_START = True
+SELF_PLAY_USE_DROPOUT_INFERENCE = True
+SELF_PLAY_MC_DROPOUT_SAMPLES = 4
+SELF_PLAY_TEMPERATURE = 0.5
 SELF_PLAY_TOP_K = 4
-INITIAL_LR = 5e-4
+EVAL_INITIAL_LR = 2e-4
+NEXT_INITIAL_LR = 2e-4
 LR_REDUCE_PATIENCE_STEPS = 1000
 LR_REDUCE_FACTOR = 0.9
 LEGAL_LOSS_WEIGHT = 0.2
+ERROR_RATE_EPS = 1e-3
+ERROR_RATE_MIN_ABS_TARGET = 0.1
 EVAL_PERSPECTIVE = "white"  # "white" or "side_to_move"
+EVAL_TANH_K_PAWNS = 4.0
+VALIDATE_EVERY_STEPS = 100
+VAL_BATCH_SIZE = 256
+VAL_CACHE_PATH = "artifacts/validation/val_batch.npz"
+RES_TOWER_CHANNELS = 320
+RES_TOWER_BLOCKS = 8
+MODEL_ROOT_DIR = "models"
+EVAL_MODEL_TAG = "eval_cnn"
+NEXT_BOARD_ARCH = "cnn"  # "cnn" or "transformer"
+NEXT_BOARD_MODEL_TAG = f"next_board_{NEXT_BOARD_ARCH}"
+BEST_EVAL_CKPT_PATH = f"{MODEL_ROOT_DIR}/{EVAL_MODEL_TAG}/best_eval_model.keras"
+BEST_NEXT_CKPT_PATH = f"{MODEL_ROOT_DIR}/{NEXT_BOARD_MODEL_TAG}/best_next_board_{NEXT_BOARD_ARCH}.keras"
+LEGACY_BEST_EVAL_CKPT_PATH = "checkpoints/best_eval_model.keras"
+LEGACY_BEST_NEXT_CKPT_PATH = "checkpoints/best_next_board_model.keras"
 RESUME_FROM_BEST_CHECKPOINT = True
-BEST_EVAL_CKPT_PATH = "checkpoints/best_eval_model.keras"
-BEST_NEXT_CKPT_PATH = "checkpoints/best_next_board_model.keras"
+RESUME_EVAL_MODEL = True
+RESUME_NEXT_BOARD_MODEL = False
 
 EMPTY_SQUARE = 0
 WHITE_PAWN = 1
@@ -142,6 +172,17 @@ PIECE_TO_ASSET = {
 _PIECE_IMAGE_CACHE: dict[tuple[int, int], "Image.Image"] = {}
 
 
+def configure_tf_memory_growth() -> None:
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        if len(gpus) > 0:
+            print(f"Enabled TensorFlow memory growth on {len(gpus)} GPU(s)")
+    except Exception as e:
+        print(f"Could not enable TensorFlow memory growth: {e}")
+
+
 def transformer_block(x, heads=4, ff_dim=128, dropout=0.1):
     attn_out = MultiHeadAttention(num_heads=heads, key_dim=MODEL_DIM // heads)(x, x)
     attn_out = Dropout(dropout)(attn_out)
@@ -154,33 +195,62 @@ def transformer_block(x, heads=4, ff_dim=128, dropout=0.1):
     return x
 
 
-def build_eval_model() -> keras.Model:
-    inp = Input(shape=(SEQ_LEN,), dtype="int32", name="board_tokens")
+def residual_block_1d(x, channels: int, kernel_size: int = 3, dropout: float = 0.1):
+    shortcut = x
 
+    y = Conv1D(channels, kernel_size=kernel_size, padding="same", use_bias=False)(x)
+    y = BatchNormalization()(y)
+    y = Activation("relu")(y)
+    y = Dropout(dropout)(y)
+
+    y = Conv1D(channels, kernel_size=kernel_size, padding="same", use_bias=False)(y)
+    y = BatchNormalization()(y)
+
+    x = Add()([shortcut, y])
+    x = Activation("relu")(x)
+    return x
+
+
+def build_residual_tower_from_tokens(inp):
     tok_emb = Embedding(input_dim=NUM_TOKENS, output_dim=MODEL_DIM)(inp)
     pos_ids = tf.expand_dims(tf.range(start=0, limit=SEQ_LEN, delta=1), axis=0)
     pos_emb = Embedding(input_dim=SEQ_LEN, output_dim=MODEL_DIM)(pos_ids)
     x = tok_emb + pos_emb
 
-    for _ in range(NUM_TRANSFORMER_BLOCKS):
-        x = transformer_block(x, heads=NUM_HEADS, ff_dim=FF_DIM, dropout=DROPOUT_RATE)
+    x = Conv1D(RES_TOWER_CHANNELS, kernel_size=1, padding="same", use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
 
-    x = LayerNormalization(epsilon=1e-6)(x)
+    for _ in range(RES_TOWER_BLOCKS):
+        x = residual_block_1d(x, channels=RES_TOWER_CHANNELS, kernel_size=3, dropout=DROPOUT_RATE)
 
-    x = GlobalAveragePooling1D()(x)
+    return x
+
+
+def build_eval_model() -> keras.Model:
+    inp = Input(shape=(SEQ_LEN,), dtype="int32", name="board_tokens")
+
+    # AlphaZero-style residual trunk + value head.
+    x = build_residual_tower_from_tokens(inp)
+
+    x_avg = GlobalAveragePooling1D()(x)
+    x_max = GlobalMaxPooling1D()(x)
+    x = Concatenate()([x_avg, x_max])
+    x = Dense(128, activation="relu")(x)
+    x = Dropout(DROPOUT_RATE + 0.05)(x)
     x = Dense(64, activation="relu")(x)
     x = Dropout(DROPOUT_RATE)(x)
-    out = Dense(1, name="eval_out")(x)
+    out = Dense(1, activation="tanh", name="eval_out")(x)
     model = keras.Model(inp, out, name="eval_model")
     model.compile(
-        optimizer=keras.optimizers.Adam(INITIAL_LR),
+        optimizer=keras.optimizers.Adam(EVAL_INITIAL_LR),
         loss=keras.losses.MeanSquaredError(),
         metrics=[keras.metrics.MeanAbsoluteError(name="mae")],
     )
     return model
 
 
-def build_next_board_model() -> keras.Model:
+def build_next_board_model_transformer() -> keras.Model:
     inp = Input(shape=(SEQ_LEN,), dtype="int32", name="board_tokens")
 
     tok_emb = Embedding(input_dim=NUM_TOKENS, output_dim=MODEL_DIM)(inp)
@@ -196,11 +266,36 @@ def build_next_board_model() -> keras.Model:
     out = Dense(NUM_TOKENS, name="next_board_logits")(x)
     model = keras.Model(inp, out, name="next_board_model")
     model.compile(
-        optimizer=keras.optimizers.Adam(INITIAL_LR),
+        optimizer=keras.optimizers.Adam(NEXT_INITIAL_LR),
         loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
         metrics=[keras.metrics.SparseCategoricalAccuracy(name="token_acc")],
     )
     return model
+
+
+def build_next_board_model_cnn() -> keras.Model:
+    inp = Input(shape=(SEQ_LEN,), dtype="int32", name="board_tokens")
+
+    # AlphaZero-style residual trunk + policy-like head over board tokens.
+    x = build_residual_tower_from_tokens(inp)
+    x = Conv1D(64, kernel_size=1, padding="same", use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
+
+    out = Dense(NUM_TOKENS, name="next_board_logits")(x)
+    model = keras.Model(inp, out, name="next_board_model_cnn")
+    model.compile(
+        optimizer=keras.optimizers.Adam(NEXT_INITIAL_LR),
+        loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=[keras.metrics.SparseCategoricalAccuracy(name="token_acc")],
+    )
+    return model
+
+
+def build_next_board_model() -> keras.Model:
+    if NEXT_BOARD_ARCH == "cnn":
+        return build_next_board_model_cnn()
+    return build_next_board_model_transformer()
 
 
 def _token_index_to_square(idx: int) -> "int":
@@ -360,6 +455,44 @@ def _predict_next_board_fallback(logits: np.ndarray, board_tokens: np.ndarray) -
     return next_tokens
 
 
+def _predict_next_board_from_eval(eval_model: keras.Model, board_tokens: np.ndarray) -> np.ndarray:
+    if not CHESS_AVAILABLE:
+        return board_tokens.copy()
+
+    board = _tokens_to_chess_board(board_tokens)
+    if board is None:
+        return board_tokens.copy()
+
+    legal_moves = list(board.legal_moves)
+    if len(legal_moves) == 0:
+        return board_tokens.copy()
+
+    candidates: list[np.ndarray] = []
+    for mv in legal_moves:
+        b = board.copy(stack=False)
+        b.push(mv)
+        candidates.append(_chess_board_to_tokens(b))
+
+    stacked = np.stack(candidates, axis=0)
+
+    if SELF_PLAY_USE_DROPOUT_INFERENCE:
+        sample_evals = []
+        for _ in range(max(1, SELF_PLAY_MC_DROPOUT_SAMPLES)):
+            sample = eval_model(stacked, training=True).numpy().reshape(-1)
+            sample_evals.append(sample)
+        evals = np.mean(np.stack(sample_evals, axis=0), axis=0)
+    else:
+        evals = eval_model.predict(stacked, verbose=0).reshape(-1)
+
+    # Eval is normalized white perspective. White to move maximizes, black to move minimizes.
+    if int(board_tokens[0]) == WHITE_TO_MOVE:
+        idx = int(np.argmax(evals))
+    else:
+        idx = int(np.argmin(evals))
+
+    return candidates[idx]
+
+
 def fetch_batch(batch_size: int):
     x_batch, y_board_batch, y_eval_batch = [], [], []
     failures = 0
@@ -377,6 +510,9 @@ def fetch_batch(batch_size: int):
             # Stockfish score is side-to-move perspective. Convert to white perspective if configured.
             if EVAL_PERSPECTIVE == "white" and int(x_tokens[0]) == BLACK_TO_MOVE:
                 eval_value = -eval_value
+
+            # Stable chess eval normalization: y = tanh(cp / k), here eval_value is in pawns.
+            eval_value = float(np.tanh(eval_value / EVAL_TANH_K_PAWNS))
 
             y_eval_batch.append(np.float32(eval_value))
         except Exception:
@@ -397,6 +533,73 @@ def get_model_summary_text(model: keras.Model) -> str:
     buf = StringIO()
     model.summary(print_fn=lambda x: buf.write(x + "\n"))
     return buf.getvalue()
+
+
+def compute_error_rate_pct(y_true: np.ndarray, y_pred: np.ndarray, eps: float = ERROR_RATE_EPS) -> float:
+    y_true = y_true.astype(np.float32).reshape(-1)
+    y_pred = y_pred.astype(np.float32).reshape(-1)
+    denom = np.maximum(np.abs(y_true), eps)
+    pct = np.abs(y_pred - y_true) / denom
+    return float(np.mean(pct) * 100.0)
+
+
+def compute_filtered_error_rate_pct(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    min_abs_target: float = ERROR_RATE_MIN_ABS_TARGET,
+    eps: float = ERROR_RATE_EPS,
+) -> float:
+    y_true = y_true.astype(np.float32).reshape(-1)
+    y_pred = y_pred.astype(np.float32).reshape(-1)
+    mask = np.abs(y_true) >= float(min_abs_target)
+    if not np.any(mask):
+        return 0.0
+    yt = y_true[mask]
+    yp = y_pred[mask]
+    denom = np.maximum(np.abs(yt), eps)
+    return float(np.mean(np.abs(yp - yt) / denom) * 100.0)
+
+
+def compute_smape_pct(y_true: np.ndarray, y_pred: np.ndarray, eps: float = ERROR_RATE_EPS) -> float:
+    y_true = y_true.astype(np.float32).reshape(-1)
+    y_pred = y_pred.astype(np.float32).reshape(-1)
+    denom = np.abs(y_true) + np.abs(y_pred) + eps
+    smape = 200.0 * np.abs(y_pred - y_true) / denom
+    return float(np.mean(smape))
+
+
+def denormalize_eval(y_norm: np.ndarray) -> np.ndarray:
+    # Inverse of y = tanh(cp / k), returns eval in pawns.
+    y_norm = np.clip(y_norm.astype(np.float32), -0.999999, 0.999999)
+    return np.arctanh(y_norm) * EVAL_TANH_K_PAWNS
+
+
+def normalize_eval(y_raw: np.ndarray) -> np.ndarray:
+    y_raw = y_raw.astype(np.float32)
+    return np.tanh(y_raw / EVAL_TANH_K_PAWNS)
+
+
+def load_or_create_validation_batch(cache_path: str, batch_size: int):
+    try:
+        if os.path.exists(cache_path):
+            data = np.load(cache_path)
+            x_val = data["x"]
+            y_board_val = data["y_board"]
+            y_eval_val = data["y_eval"]
+            print(f"Loaded validation batch from {cache_path} (n={x_val.shape[0]})")
+            return x_val, y_board_val, y_eval_val
+    except Exception as e:
+        print(f"Failed loading validation cache {cache_path}: {e}")
+
+    x_val, y_board_val, y_eval_val = fetch_batch(batch_size)
+    if x_val is None:
+        print("Validation batch not available from API")
+        return None, None, None
+
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    np.savez_compressed(cache_path, x=x_val, y_board=y_board_val, y_eval=y_eval_val)
+    print(f"Created validation batch cache at {cache_path} (n={x_val.shape[0]})")
+    return x_val, y_board_val, y_eval_val
 
 
 def _get_optimizer_lr(optimizer: keras.optimizers.Optimizer) -> float:
@@ -430,6 +633,26 @@ def _try_resume_from_best_checkpoint(model: keras.Model, checkpoint_path: str, m
     except Exception as e:
         print(f"Failed to resume {model_name} from {checkpoint_path}: {e}")
         return False
+
+
+def _resume_if_enabled(model: keras.Model, checkpoint_path: str, model_name: str, enabled: bool) -> bool:
+    if not enabled:
+        print(f"Resume disabled for {model_name}; training from scratch")
+        return False
+    return _try_resume_from_best_checkpoint(model, checkpoint_path, model_name)
+
+
+def _prepare_model_dirs_and_migrate_legacy() -> None:
+    os.makedirs(os.path.dirname(BEST_EVAL_CKPT_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(BEST_NEXT_CKPT_PATH), exist_ok=True)
+
+    if os.path.exists(LEGACY_BEST_EVAL_CKPT_PATH) and not os.path.exists(BEST_EVAL_CKPT_PATH):
+        shutil.move(LEGACY_BEST_EVAL_CKPT_PATH, BEST_EVAL_CKPT_PATH)
+        print(f"Moved legacy eval checkpoint -> {BEST_EVAL_CKPT_PATH}")
+
+    if os.path.exists(LEGACY_BEST_NEXT_CKPT_PATH) and not os.path.exists(BEST_NEXT_CKPT_PATH):
+        shutil.move(LEGACY_BEST_NEXT_CKPT_PATH, BEST_NEXT_CKPT_PATH)
+        print(f"Moved legacy next-board checkpoint -> {BEST_NEXT_CKPT_PATH}")
 
 
 def _default_start_board_tokens() -> np.ndarray:
@@ -563,7 +786,6 @@ def _render_board_frame(board_tokens: np.ndarray, ply: int, eval_score: float) -
 
 
 def create_and_log_self_play_gif(
-    next_board_model: keras.Model,
     eval_model: keras.Model,
     step: int,
     seed_board: np.ndarray | None = None,
@@ -575,20 +797,27 @@ def create_and_log_self_play_gif(
 
         os.makedirs("artifacts/self_play", exist_ok=True)
 
-        current = (
-            seed_board.astype(np.int32).copy()
-            if seed_board is not None and seed_board.shape == (65,)
-            else _default_start_board_tokens()
-        )
+        if SELF_PLAY_ALWAYS_FROM_START:
+            current = _default_start_board_tokens()
+        else:
+            current = (
+                seed_board.astype(np.int32).copy()
+                if seed_board is not None and seed_board.shape == (65,)
+                else _default_start_board_tokens()
+            )
 
         frames = []
         evals = []
         for ply in range(SELF_PLAY_PLIES + 1):
-            ev = float(eval_model.predict(current[None, :], verbose=0)[0][0])
+            ev = float(eval_model(current[None, :], training=SELF_PLAY_USE_DROPOUT_INFERENCE).numpy()[0][0])
             evals.append(ev)
             frames.append(_render_board_frame(current, ply=ply, eval_score=ev))
             if ply < SELF_PLAY_PLIES:
-                current = _predict_next_board(next_board_model, current)
+                if CHESS_AVAILABLE:
+                    board = _tokens_to_chess_board(current)
+                    if board is not None and board.is_game_over():
+                        break
+                current = _predict_next_board_from_eval(eval_model, current)
 
         ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
         gif_path = f"artifacts/self_play/self_play_step_{step}_{ts}.gif"
@@ -615,64 +844,65 @@ def create_and_log_self_play_gif(
 
 
 if __name__ == "__main__":
+    configure_tf_memory_growth()
+    _prepare_model_dirs_and_migrate_legacy()
+
     wandb.init(
-        project="chess-transformer",
+        project="chess-transformer-eval-only",
         config={
             "steps": STEPS,
             "batch_size": BATCH_SIZE,
-            "lr": INITIAL_LR,
+            "eval_lr": EVAL_INITIAL_LR,
             "eval_perspective": EVAL_PERSPECTIVE,
+            "eval_norm": "tanh",
+            "eval_tanh_k_pawns": EVAL_TANH_K_PAWNS,
+            "validate_every_steps": VALIDATE_EVERY_STEPS,
+            "val_batch_size": VAL_BATCH_SIZE,
+            "val_cache_path": VAL_CACHE_PATH,
+            "res_tower_channels": RES_TOWER_CHANNELS,
+            "res_tower_blocks": RES_TOWER_BLOCKS,
+            "best_eval_ckpt_path": BEST_EVAL_CKPT_PATH,
             "model_dim": MODEL_DIM,
             "num_heads": NUM_HEADS,
             "ff_dim": FF_DIM,
             "num_transformer_blocks": NUM_TRANSFORMER_BLOCKS,
             "dropout_rate": DROPOUT_RATE,
-            "self_play_temperature": SELF_PLAY_TEMPERATURE,
-            "self_play_top_k": SELF_PLAY_TOP_K,
-            "legal_loss_weight": LEGAL_LOSS_WEIGHT,
+            "self_play_plies": SELF_PLAY_PLIES,
             "lr_reduce_patience_steps": LR_REDUCE_PATIENCE_STEPS,
             "lr_reduce_factor": LR_REDUCE_FACTOR,
+            "train_mode": "eval_only",
         },
     )
 
     eval_model = build_eval_model()
-    next_board_model = build_next_board_model()
 
-    eval_resumed = _try_resume_from_best_checkpoint(
+    eval_resumed = _resume_if_enabled(
         model=eval_model,
         checkpoint_path=BEST_EVAL_CKPT_PATH,
         model_name="eval_model",
-    )
-    next_resumed = _try_resume_from_best_checkpoint(
-        model=next_board_model,
-        checkpoint_path=BEST_NEXT_CKPT_PATH,
-        model_name="next_board_model",
+        enabled=RESUME_EVAL_MODEL,
     )
 
     wandb.run.summary["resumed_eval_model"] = bool(eval_resumed)
-    wandb.run.summary["resumed_next_board_model"] = bool(next_resumed)
 
     eval_model.summary()
-    next_board_model.summary()
 
     # Log model summaries to W&B
     eval_summary_text = get_model_summary_text(eval_model)
-    next_summary_text = get_model_summary_text(next_board_model)
 
     with open("eval_model_summary.txt", "w", encoding="utf-8") as f:
         f.write(eval_summary_text)
-    with open("next_board_model_summary.txt", "w", encoding="utf-8") as f:
-        f.write(next_summary_text)
 
     wandb.save("eval_model_summary.txt")
-    wandb.save("next_board_model_summary.txt")
     wandb.run.summary["eval_model_params"] = int(eval_model.count_params())
-    wandb.run.summary["next_board_model_params"] = int(next_board_model.count_params())
+    wandb.run.summary["target_eval_model_params"] = 5_000_000
 
-    os.makedirs("checkpoints", exist_ok=True)
+    x_val, _y_board_val, y_eval_val = load_or_create_validation_batch(VAL_CACHE_PATH, VAL_BATCH_SIZE)
+    has_val = x_val is not None
+    wandb.run.summary["has_validation_batch"] = bool(has_val)
+
     best_eval_loss = float("inf")
-    best_next_loss = float("inf")
-    last_improvement_step = 0
+    last_eval_improvement_step = 0
 
     for step in range(STEPS):
         x_batch, y_board_batch, y_eval_batch = fetch_batch(BATCH_SIZE)
@@ -691,17 +921,25 @@ if __name__ == "__main__":
         eval_target_max = float(np.max(y_eval_batch))
 
         eval_metrics = eval_model.train_on_batch(x_in, y_eval_batch, return_dict=True)
-        next_metrics = train_next_board_step(next_board_model, x_in, y_board_batch)
+        eval_pred_batch = eval_model.predict(x_in, verbose=0).reshape(-1)
+        eval_mae_batch = float(np.mean(np.abs(eval_pred_batch - y_eval_batch)))
+        eval_loss_batch = float(np.mean(np.square(eval_pred_batch - y_eval_batch)))
+        eval_error_rate_pct = compute_error_rate_pct(y_eval_batch, eval_pred_batch)
+        eval_error_rate_filtered_pct = compute_filtered_error_rate_pct(y_eval_batch, eval_pred_batch)
+        eval_smape_pct = compute_smape_pct(y_eval_batch, eval_pred_batch)
+        eval_mae_raw = float(np.mean(np.abs(denormalize_eval(eval_pred_batch) - denormalize_eval(y_eval_batch))))
 
         wandb.log(
             {
                 "step": step + 1,
-                "eval/loss": float(eval_metrics["loss"]),
-                "eval/mae": float(eval_metrics["mae"]),
-                "next_board/loss": float(next_metrics["loss"]),
-                "next_board/token_acc": float(next_metrics["token_acc"]),
-                "next_board/ce_loss": float(next_metrics.get("ce_loss", next_metrics["loss"])),
-                "next_board/legal_mass_loss": float(next_metrics.get("legal_mass_loss", 0.0)),
+                "eval/loss": eval_loss_batch,
+                "eval/mae": eval_mae_batch,
+                "eval/loss_running": float(eval_metrics["loss"]),
+                "eval/mae_running": float(eval_metrics["mae"]),
+                "eval/error_rate_pct": eval_error_rate_pct,
+                "eval/error_rate_filtered_pct": eval_error_rate_filtered_pct,
+                "eval/smape_pct": eval_smape_pct,
+                "eval/mae_raw": eval_mae_raw,
                 "data/eval_target_mean": eval_target_mean,
                 "data/eval_target_min": eval_target_min,
                 "data/eval_target_max": eval_target_max,
@@ -713,71 +951,67 @@ if __name__ == "__main__":
             step=step + 1,
         )
 
+        if has_val and ((step + 1) % VALIDATE_EVERY_STEPS == 0):
+            val_pred = eval_model.predict(x_val, verbose=0).reshape(-1)
+            val_mae = float(np.mean(np.abs(val_pred - y_eval_val)))
+            val_loss = float(np.mean(np.square(val_pred - y_eval_val)))
+            val_smape = compute_smape_pct(y_eval_val, val_pred)
+            val_mae_raw = float(np.mean(np.abs(denormalize_eval(val_pred) - denormalize_eval(y_eval_val))))
+
+            wandb.log(
+                {
+                    "val/eval_loss": val_loss,
+                    "val/eval_mae": val_mae,
+                    "val/eval_mae_raw": val_mae_raw,
+                    "val/eval_smape_pct": val_smape,
+                },
+                step=step + 1,
+            )
+
         if (step + 1) % SELF_PLAY_GIF_EVERY_STEPS == 0:
             seed_board = x_batch[0] if x_batch.shape[0] > 0 else None
             create_and_log_self_play_gif(
-                next_board_model=next_board_model,
                 eval_model=eval_model,
                 step=step + 1,
                 seed_board=seed_board,
             )
 
         # Save best checkpoints
-        improved = False
-        if float(eval_metrics["loss"]) < best_eval_loss:
-            best_eval_loss = float(eval_metrics["loss"])
-            eval_model.save("checkpoints/best_eval_model.keras")
+        eval_improved = False
+        if eval_loss_batch < best_eval_loss:
+            best_eval_loss = eval_loss_batch
+            eval_model.save(BEST_EVAL_CKPT_PATH)
             wandb.run.summary["best_eval_loss"] = best_eval_loss
             wandb.run.summary["best_eval_step"] = step + 1
-            improved = True
+            eval_improved = True
 
-        if float(next_metrics["loss"]) < best_next_loss:
-            best_next_loss = float(next_metrics["loss"])
-            next_board_model.save("checkpoints/best_next_board_model.keras")
-            wandb.run.summary["best_next_board_loss"] = best_next_loss
-            wandb.run.summary["best_next_board_step"] = step + 1
-            improved = True
+        if eval_improved:
+            last_eval_improvement_step = step + 1
 
-        if improved:
-            last_improvement_step = step + 1
+        reduced_eval = 0
 
-        if (step + 1) - last_improvement_step >= LR_REDUCE_PATIENCE_STEPS:
+        if (step + 1) - last_eval_improvement_step >= LR_REDUCE_PATIENCE_STEPS:
             eval_lr = _get_optimizer_lr(eval_model.optimizer)
-            next_lr = _get_optimizer_lr(next_board_model.optimizer)
             new_eval_lr = eval_lr * LR_REDUCE_FACTOR
-            new_next_lr = next_lr * LR_REDUCE_FACTOR
             _set_optimizer_lr(eval_model.optimizer, new_eval_lr)
-            _set_optimizer_lr(next_board_model.optimizer, new_next_lr)
-            last_improvement_step = step + 1
-
-            wandb.log(
-                {
-                    "lr/eval": new_eval_lr,
-                    "lr/next_board": new_next_lr,
-                    "lr/reduced_on_plateau": 1,
-                },
-                step=step + 1,
-            )
+            last_eval_improvement_step = step + 1
+            reduced_eval = 1
             print(
-                f"Step {step + 1}: no improvement for {LR_REDUCE_PATIENCE_STEPS} steps, "
-                f"reduced learning rates by 10% -> eval_lr={new_eval_lr:.8f}, next_lr={new_next_lr:.8f}"
+                f"Step {step + 1}: eval plateau {LR_REDUCE_PATIENCE_STEPS} steps -> eval_lr={new_eval_lr:.8f}"
             )
-        else:
-            wandb.log(
-                {
-                    "lr/eval": _get_optimizer_lr(eval_model.optimizer),
-                    "lr/next_board": _get_optimizer_lr(next_board_model.optimizer),
-                    "lr/reduced_on_plateau": 0,
-                },
-                step=step + 1,
-            )
+
+        wandb.log(
+            {
+                "lr/eval": _get_optimizer_lr(eval_model.optimizer),
+                "lr/eval_reduced_on_plateau": reduced_eval,
+            },
+            step=step + 1,
+        )
 
         print(
             f"Step {step + 1}/{STEPS} | "
-            f"eval_loss={eval_metrics['loss']:.4f} "
-            f"eval_mae={eval_metrics['mae']:.4f} | "
-            f"next_loss={next_metrics['loss']:.4f} "
-            f"next_acc={next_metrics['token_acc']:.4f}"
+            f"eval_loss={eval_loss_batch:.4f} "
+            f"eval_mae={eval_mae_batch:.4f}"
         )
 
     wandb.finish()

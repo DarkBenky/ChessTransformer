@@ -1,6 +1,6 @@
 from train import fetch_batch
 from pprint import pprint
-from dataHelper import tokens_to_board, board_to_tokens
+from dataHelper import tokens_to_board, board_to_feature_planes
 import chess
 import random
 import cachetools
@@ -9,6 +9,7 @@ import time
 import numpy as np
 
 cache = cachetools.LRUCache(maxsize=100_000)
+search_cache = cachetools.LRUCache(maxsize=500_000)
 model = None
 DEBUG_EVAL = False
 
@@ -18,7 +19,7 @@ def _model_predict_batch(token_batch: np.ndarray) -> np.ndarray:
     if model is None:
         return np.random.randint(-10, 11, size=(token_batch.shape[0],)).astype(np.float32)
 
-    preds = model(token_batch, training=False).numpy().reshape(-1)
+    preds = model(token_batch.astype(np.float32), training=False).numpy().reshape(-1)
     return preds.astype(np.float32)
 
 def evaluate(board: chess.Board) -> float:
@@ -27,8 +28,8 @@ def evaluate(board: chess.Board) -> float:
     elif board.is_stalemate() or board.is_insufficient_material():
         return 0
 
-    token_batch = board_to_tokens(board).reshape(1, -1).astype(np.int32)
-    output = float(_model_predict_batch(token_batch)[0])
+    plane_batch = board_to_feature_planes(board).reshape(1, 8, 8, 54).astype(np.float32)
+    output = float(_model_predict_batch(plane_batch)[0])
     if DEBUG_EVAL:
         print(f"Evaluating board: {board.fen()} -> {output}")
     return output
@@ -49,7 +50,7 @@ def evalBoardsBatch(boards: list[chess.Board]) -> list[float]:
 
     out: list[float | None] = [None] * len(boards)
     missing_idx: list[int] = []
-    missing_tokens: list[np.ndarray] = []
+    missing_planes: list[np.ndarray] = []
 
     for i, b in enumerate(boards):
         fen = b.fen()
@@ -69,10 +70,10 @@ def evalBoardsBatch(boards: list[chess.Board]) -> list[float]:
             continue
 
         missing_idx.append(i)
-        missing_tokens.append(board_to_tokens(b).astype(np.int32))
+        missing_planes.append(board_to_feature_planes(b).astype(np.float32))
 
-    if len(missing_tokens) > 0:
-        batch = np.stack(missing_tokens, axis=0)
+    if len(missing_planes) > 0:
+        batch = np.stack(missing_planes, axis=0)
         preds = _model_predict_batch(batch)
         for j, i in enumerate(missing_idx):
             score = float(preds[j])
@@ -104,39 +105,72 @@ def _select_top_k_moves(board: chess.Board, legal_moves: list[chess.Move], top_k
     ranked.sort(key=lambda x: x[0], reverse=True)
     return [mv for _, mv in ranked[:top_k]]
         
-def search(board: chess.Board, depth: int, return_move: bool = True, top_k: int | None = None):
-    # function returns the best next board state
+def _search_score(board: chess.Board, depth: int, alpha: float, beta: float, top_k: int | None) -> float:
     if depth == 0 or board.is_game_over():
         return evalBoard(board)
-    
+
+    cache_key = (board.fen(), depth)
+    cached = search_cache.get(cache_key)
+    if cached is not None:
+        return float(cached)
+
+    legal_moves = list(board.legal_moves)
+    if not legal_moves:
+        return evalBoard(board)
+
+    candidate_moves = _select_top_k_moves(board, legal_moves, top_k)
+    best_score = float("-inf")
+    for move in candidate_moves:
+        board.push(move)
+        score = -_search_score(board, depth - 1, -beta, -alpha, top_k)
+        board.pop()
+
+        if score > best_score:
+            best_score = score
+        if best_score > alpha:
+            alpha = best_score
+        if alpha >= beta:
+            break
+
+    search_cache[cache_key] = best_score
+    return best_score
+
+
+def search(board: chess.Board, depth: int, return_move: bool = True, top_k: int | None = None):
+    if depth == 0 or board.is_game_over():
+        return evalBoard(board)
+
     legal_moves = list(board.legal_moves)
     if not legal_moves:
         return None if return_move else evalBoard(board)
 
     candidate_moves = _select_top_k_moves(board, legal_moves, top_k)
-
-    best_score = float('-inf')
+    alpha = float("-inf")
+    beta = float("inf")
     best_move = candidate_moves[0]
+    best_score = float("-inf")
+
     for move in candidate_moves:
         board.push(move)
-        score = -search(board, depth - 1, return_move=False, top_k=top_k)  # Negate score for opponent's perspective
-        board.pop()  # Undo the move
-        
+        score = -_search_score(board, depth - 1, -beta, -alpha, top_k)
+        board.pop()
         if score > best_score:
             best_score = score
             best_move = move
+        if best_score > alpha:
+            alpha = best_score
 
     return best_move if return_move else best_score
 
 
 def bestBoard(board: chess.Board, depth: int, top_k: int | None = None) -> tuple[chess.Board, float, float]:
     start = time.time()
+    search_cache.clear()
     best_move = search(board, depth, top_k=top_k)
     if best_move is None:
         return board, float(evalBoard(board)), time.time() - start  # No legal moves
-    best_score = float("-inf")
     board.push(best_move)
-    best_score = -float(search(board, depth - 1, return_move=False, top_k=top_k))
+    best_score = -float(_search_score(board, depth - 1, float("-inf"), float("inf"), top_k))
     board.pop()
 
     board.push(best_move)

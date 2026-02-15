@@ -2,6 +2,9 @@ import numpy as np
 import chess
 import base64
 
+BOARD_SIZE = 8
+FEATURE_PLANES = 54
+
 def bytes_to_tokens(board_bytes: bytes) -> np.ndarray:
     """
     Convert tokenized board bytes to numpy array of integers.
@@ -112,6 +115,189 @@ def board_to_tokens(board: chess.Board) -> np.ndarray:
         tokens[square + 1] = token  # +1 to account for turn byte at index 0
     
     return tokens
+
+
+def _square_row_col(square: int) -> tuple[int, int]:
+    return 7 - chess.square_rank(square), chess.square_file(square)
+
+
+def _set_plane_square(planes: np.ndarray, plane_idx: int, square: int, value: float = 1.0) -> None:
+    r, c = _square_row_col(square)
+    planes[r, c, plane_idx] = value
+
+
+def board_to_feature_planes(board: chess.Board) -> np.ndarray:
+    planes = np.zeros((BOARD_SIZE, BOARD_SIZE, FEATURE_PLANES), dtype=np.float32)
+
+    piece_plane = {
+        (chess.PAWN, chess.WHITE): 0,
+        (chess.KNIGHT, chess.WHITE): 1,
+        (chess.BISHOP, chess.WHITE): 2,
+        (chess.ROOK, chess.WHITE): 3,
+        (chess.QUEEN, chess.WHITE): 4,
+        (chess.KING, chess.WHITE): 5,
+        (chess.PAWN, chess.BLACK): 6,
+        (chess.KNIGHT, chess.BLACK): 7,
+        (chess.BISHOP, chess.BLACK): 8,
+        (chess.ROOK, chess.BLACK): 9,
+        (chess.QUEEN, chess.BLACK): 10,
+        (chess.KING, chess.BLACK): 11,
+    }
+
+    for square, piece in board.piece_map().items():
+        _set_plane_square(planes, piece_plane[(piece.piece_type, piece.color)], square)
+
+    planes[:, :, 12] = 1.0 if board.turn == chess.WHITE else 0.0
+    planes[:, :, 13] = 1.0 if board.has_kingside_castling_rights(chess.WHITE) else 0.0
+    planes[:, :, 14] = 1.0 if board.has_queenside_castling_rights(chess.WHITE) else 0.0
+    planes[:, :, 15] = 1.0 if board.has_kingside_castling_rights(chess.BLACK) else 0.0
+    planes[:, :, 16] = 1.0 if board.has_queenside_castling_rights(chess.BLACK) else 0.0
+    if board.ep_square is not None:
+        _set_plane_square(planes, 17, board.ep_square)
+
+    white_attackers_count = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    black_attackers_count = np.zeros((BOARD_SIZE, BOARD_SIZE), dtype=np.float32)
+    for square in chess.SQUARES:
+        wr, wc = _square_row_col(square)
+        white_attackers_count[wr, wc] = float(len(board.attackers(chess.WHITE, square)))
+        black_attackers_count[wr, wc] = float(len(board.attackers(chess.BLACK, square)))
+        if board.is_attacked_by(chess.WHITE, square):
+            _set_plane_square(planes, 18, square)
+        if board.is_attacked_by(chess.BLACK, square):
+            _set_plane_square(planes, 19, square)
+
+    for square in board.pieces(chess.PAWN, chess.WHITE):
+        for target in board.attacks(square):
+            _set_plane_square(planes, 20, target)
+    for square in board.pieces(chess.PAWN, chess.BLACK):
+        for target in board.attacks(square):
+            _set_plane_square(planes, 21, target)
+
+    white_board = board.copy(stack=False)
+    white_board.turn = chess.WHITE
+    black_board = board.copy(stack=False)
+    black_board.turn = chess.BLACK
+    planes[:, :, 22] = min(1.0, len(list(white_board.legal_moves)) / 64.0)
+    planes[:, :, 23] = min(1.0, len(list(black_board.legal_moves)) / 64.0)
+
+    piece_type_to_plane = {
+        chess.PAWN: 24,
+        chess.KNIGHT: 25,
+        chess.BISHOP: 26,
+        chess.ROOK: 27,
+        chess.QUEEN: 28,
+        chess.KING: 29,
+    }
+    for move in list(white_board.legal_moves) + list(black_board.legal_moves):
+        piece = board.piece_at(move.from_square)
+        if piece is None:
+            continue
+        _set_plane_square(planes, piece_type_to_plane[piece.piece_type], move.to_square, 1.0)
+
+    king_zone_offsets = (-9, -8, -7, -1, 0, 1, 7, 8, 9)
+    white_king_sq = board.king(chess.WHITE)
+    black_king_sq = board.king(chess.BLACK)
+    if white_king_sq is not None:
+        for offset in king_zone_offsets:
+            sq = white_king_sq + offset
+            if 0 <= sq < 64 and abs(chess.square_file(sq) - chess.square_file(white_king_sq)) <= 1:
+                if board.is_attacked_by(chess.BLACK, sq):
+                    _set_plane_square(planes, 30, sq)
+        planes[:, :, 32] = 1.0 if board.is_check() and board.turn == chess.WHITE else 0.0
+        for sq in board.attacks(white_king_sq):
+            piece = board.piece_at(sq)
+            if piece is not None and piece.piece_type == chess.PAWN and piece.color == chess.WHITE:
+                _set_plane_square(planes, 34, sq)
+
+    if black_king_sq is not None:
+        for offset in king_zone_offsets:
+            sq = black_king_sq + offset
+            if 0 <= sq < 64 and abs(chess.square_file(sq) - chess.square_file(black_king_sq)) <= 1:
+                if board.is_attacked_by(chess.WHITE, sq):
+                    _set_plane_square(planes, 31, sq)
+        planes[:, :, 33] = 1.0 if board.is_check() and board.turn == chess.BLACK else 0.0
+        for sq in board.attacks(black_king_sq):
+            piece = board.piece_at(sq)
+            if piece is not None and piece.piece_type == chess.PAWN and piece.color == chess.BLACK:
+                _set_plane_square(planes, 35, sq)
+
+    white_pawns = list(board.pieces(chess.PAWN, chess.WHITE))
+    black_pawns = list(board.pieces(chess.PAWN, chess.BLACK))
+    white_files = [chess.square_file(sq) for sq in white_pawns]
+    black_files = [chess.square_file(sq) for sq in black_pawns]
+    for sq in white_pawns:
+        file_idx = chess.square_file(sq)
+        rank_idx = chess.square_rank(sq)
+        if file_idx - 1 not in white_files and file_idx + 1 not in white_files:
+            _set_plane_square(planes, 38, sq)
+        if white_files.count(file_idx) > 1:
+            _set_plane_square(planes, 40, sq)
+        blockers = [
+            bp
+            for bp in black_pawns
+            if chess.square_file(bp) in (file_idx - 1, file_idx, file_idx + 1) and chess.square_rank(bp) > rank_idx
+        ]
+        if len(blockers) == 0:
+            _set_plane_square(planes, 36, sq)
+
+    for sq in black_pawns:
+        file_idx = chess.square_file(sq)
+        rank_idx = chess.square_rank(sq)
+        if file_idx - 1 not in black_files and file_idx + 1 not in black_files:
+            _set_plane_square(planes, 39, sq)
+        if black_files.count(file_idx) > 1:
+            _set_plane_square(planes, 41, sq)
+        blockers = [
+            wp
+            for wp in white_pawns
+            if chess.square_file(wp) in (file_idx - 1, file_idx, file_idx + 1) and chess.square_rank(wp) < rank_idx
+        ]
+        if len(blockers) == 0:
+            _set_plane_square(planes, 37, sq)
+
+    for square, piece in board.piece_map().items():
+        own_attackers = len(board.attackers(piece.color, square))
+        opp_attackers = len(board.attackers(not piece.color, square))
+        if opp_attackers > own_attackers:
+            _set_plane_square(planes, 42 if piece.color == chess.WHITE else 43, square)
+        if board.is_pinned(piece.color, square):
+            _set_plane_square(planes, 44 if piece.color == chess.WHITE else 45, square)
+
+    planes[:, :, 46] = np.clip((white_attackers_count - black_attackers_count) / 4.0, -1.0, 1.0)
+
+    non_pawn_material = 0
+    piece_values = {chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
+    for piece_type, value in piece_values.items():
+        non_pawn_material += value * (
+            len(board.pieces(piece_type, chess.WHITE)) + len(board.pieces(piece_type, chess.BLACK))
+        )
+    planes[:, :, 47] = min(1.0, non_pawn_material / 62.0)
+
+    center = np.array([3.5, 3.5], dtype=np.float32)
+    enemy_king_sq = board.king(not board.turn)
+    enemy_rc = (
+        np.array(_square_row_col(enemy_king_sq), dtype=np.float32)
+        if enemy_king_sq is not None
+        else np.array([3.5, 3.5], dtype=np.float32)
+    )
+    for sq in chess.SQUARES:
+        r, c = _square_row_col(sq)
+        pos = np.array([r, c], dtype=np.float32)
+        planes[r, c, 48] = np.linalg.norm(pos - center) / np.linalg.norm(np.array([0.0, 0.0]) - center)
+        planes[r, c, 49] = np.linalg.norm(pos - enemy_rc) / np.linalg.norm(np.array([0.0, 0.0]) - center)
+
+    planes[:, :, 50] = 1.0 if board.turn == chess.WHITE else -1.0
+    for mv in board.legal_moves:
+        _set_plane_square(planes, 51, mv.from_square)
+        _set_plane_square(planes, 52, mv.to_square)
+    for sq in board.checkers():
+        _set_plane_square(planes, 53, sq)
+
+    return planes
+
+
+def tokens_to_feature_planes(tokens: np.ndarray) -> np.ndarray:
+    return board_to_feature_planes(tokens_to_board(tokens))
 
 def parse_board_response(response_data: dict) -> dict:
     """

@@ -11,6 +11,7 @@ from tensorflow.keras.layers import (
     BatchNormalization,
     Concatenate,
     Conv1D,
+    Conv2D,
     Dense,
     Dropout,
     Input,
@@ -18,9 +19,11 @@ from tensorflow.keras.layers import (
     MultiHeadAttention,
     Embedding,
     GlobalAveragePooling1D,
+    GlobalAveragePooling2D,
     GlobalMaxPooling1D,
+    GlobalMaxPooling2D,
 )
-from dataHelper import parse_board_response
+from dataHelper import parse_board_response, tokens_to_feature_planes
 import numpy as np
 import requests
 import wandb
@@ -54,6 +57,8 @@ BATCH_SIZE = 32
 API_URL = "http://localhost:1323/getData"
 NUM_TOKENS = 15
 SEQ_LEN = 65
+BOARD_SIZE = 8
+INPUT_PLANES = 54
 MODEL_DIM = 64
 NUM_HEADS = 4
 FF_DIM = 256
@@ -78,8 +83,8 @@ EVAL_TANH_K_PAWNS = 4.0
 VALIDATE_EVERY_STEPS = 100
 VAL_BATCH_SIZE = 256
 VAL_CACHE_PATH = "artifacts/validation/val_batch.npz"
-RES_TOWER_CHANNELS = 320
-RES_TOWER_BLOCKS = 8
+RES_TOWER_CHANNELS = 96
+RES_TOWER_BLOCKS = 5
 MODEL_ROOT_DIR = "models"
 EVAL_MODEL_TAG = "eval_cnn"
 NEXT_BOARD_ARCH = "cnn"  # "cnn" or "transformer"
@@ -211,6 +216,22 @@ def residual_block_1d(x, channels: int, kernel_size: int = 3, dropout: float = 0
     return x
 
 
+def residual_block_2d(x, channels: int, kernel_size: int = 3, dropout: float = 0.1):
+    shortcut = x
+
+    y = Conv2D(channels, kernel_size=kernel_size, padding="same", use_bias=False)(x)
+    y = BatchNormalization()(y)
+    y = Activation("relu")(y)
+    y = Dropout(dropout)(y)
+
+    y = Conv2D(channels, kernel_size=kernel_size, padding="same", use_bias=False)(y)
+    y = BatchNormalization()(y)
+
+    x = Add()([shortcut, y])
+    x = Activation("relu")(x)
+    return x
+
+
 def build_residual_tower_from_tokens(inp):
     tok_emb = Embedding(input_dim=NUM_TOKENS, output_dim=MODEL_DIM)(inp)
     pos_ids = tf.expand_dims(tf.range(start=0, limit=SEQ_LEN, delta=1), axis=0)
@@ -228,15 +249,19 @@ def build_residual_tower_from_tokens(inp):
 
 
 def build_eval_model() -> keras.Model:
-    inp = Input(shape=(SEQ_LEN,), dtype="int32", name="board_tokens")
+    inp = Input(shape=(BOARD_SIZE, BOARD_SIZE, INPUT_PLANES), dtype="float32", name="board_planes")
 
-    # AlphaZero-style residual trunk + value head.
-    x = build_residual_tower_from_tokens(inp)
+    x = Conv2D(RES_TOWER_CHANNELS, kernel_size=3, padding="same", use_bias=False)(inp)
+    x = BatchNormalization()(x)
+    x = Activation("relu")(x)
 
-    x_avg = GlobalAveragePooling1D()(x)
-    x_max = GlobalMaxPooling1D()(x)
+    for _ in range(RES_TOWER_BLOCKS):
+        x = residual_block_2d(x, channels=RES_TOWER_CHANNELS, kernel_size=3, dropout=DROPOUT_RATE)
+
+    x_avg = GlobalAveragePooling2D()(x)
+    x_max = GlobalMaxPooling2D()(x)
     x = Concatenate()([x_avg, x_max])
-    x = Dense(128, activation="relu")(x)
+    x = Dense(256, activation="relu")(x)
     x = Dropout(DROPOUT_RATE + 0.05)(x)
     x = Dense(64, activation="relu")(x)
     x = Dropout(DROPOUT_RATE)(x)
@@ -473,7 +498,7 @@ def _predict_next_board_from_eval(eval_model: keras.Model, board_tokens: np.ndar
         b.push(mv)
         candidates.append(_chess_board_to_tokens(b))
 
-    stacked = np.stack(candidates, axis=0)
+    stacked = np.stack([tokens_to_feature_planes(tokens) for tokens in candidates], axis=0).astype(np.float32)
 
     if SELF_PLAY_USE_DROPOUT_INFERENCE:
         sample_evals = []
@@ -515,7 +540,7 @@ def fetch_batch(batch_size: int):
                 failures += 1
                 continue
 
-            x_batch.append(x_tokens)
+            x_batch.append(tokens_to_feature_planes(x_tokens))
             y_board_batch.append(y_tokens)
             eval_value = float(parsed["eval"])
 
@@ -535,7 +560,7 @@ def fetch_batch(batch_size: int):
     if len(x_batch) == 0:
         return None, None, None
 
-    x_np = np.stack(x_batch, axis=0)
+    x_np = np.stack(x_batch, axis=0).astype(np.float32)
     y_board_np = np.stack(y_board_batch, axis=0)
     y_eval_np = np.array(y_eval_batch, dtype=np.float32)
     return x_np, y_board_np, y_eval_np
@@ -821,7 +846,8 @@ def create_and_log_self_play_gif(
         frames = []
         evals = []
         for ply in range(SELF_PLAY_PLIES + 1):
-            ev = float(eval_model(current[None, :], training=SELF_PLAY_USE_DROPOUT_INFERENCE).numpy()[0][0])
+            current_planes = tokens_to_feature_planes(current)[None, :]
+            ev = float(eval_model(current_planes, training=SELF_PLAY_USE_DROPOUT_INFERENCE).numpy()[0][0])
             evals.append(ev)
             frames.append(_render_board_frame(current, ply=ply, eval_score=ev))
             if ply < SELF_PLAY_PLIES:
@@ -907,7 +933,7 @@ if __name__ == "__main__":
 
     wandb.save("eval_model_summary.txt")
     wandb.run.summary["eval_model_params"] = int(eval_model.count_params())
-    wandb.run.summary["target_eval_model_params"] = 5_000_000
+    wandb.run.summary["target_eval_model_params"] = 1_000_000
 
     x_val, _y_board_val, y_eval_val = load_or_create_validation_batch(VAL_CACHE_PATH, VAL_BATCH_SIZE)
     has_val = x_val is not None
@@ -924,10 +950,6 @@ if __name__ == "__main__":
 
         x_in = x_batch
 
-        changed_counts = np.sum(x_batch[:, 1:] != y_board_batch[:, 1:], axis=1)
-        avg_changed_squares = float(np.mean(changed_counts))
-        min_changed_squares = int(np.min(changed_counts))
-        max_changed_squares = int(np.max(changed_counts))
         eval_target_mean = float(np.mean(y_eval_batch))
         eval_target_min = float(np.min(y_eval_batch))
         eval_target_max = float(np.max(y_eval_batch))
@@ -955,9 +977,6 @@ if __name__ == "__main__":
                 "data/eval_target_mean": eval_target_mean,
                 "data/eval_target_min": eval_target_min,
                 "data/eval_target_max": eval_target_max,
-                "data/avg_changed_squares": avg_changed_squares,
-                "data/min_changed_squares": min_changed_squares,
-                "data/max_changed_squares": max_changed_squares,
                 "batch_size": int(x_batch.shape[0]),
             },
             step=step + 1,

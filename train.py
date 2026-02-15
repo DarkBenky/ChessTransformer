@@ -503,8 +503,20 @@ def fetch_batch(batch_size: int):
             resp.raise_for_status()
             parsed = parse_board_response(resp.json())
             x_tokens = parsed["X"].astype(np.int32)
+            y_tokens = parsed["Y"].astype(np.int32)
+
+            # Token 0 is side-to-move (13 white / 14 black). Skip malformed rows.
+            if (
+                x_tokens.shape != (SEQ_LEN,)
+                or y_tokens.shape != (SEQ_LEN,)
+                or int(x_tokens[0]) not in (WHITE_TO_MOVE, BLACK_TO_MOVE)
+                or int(y_tokens[0]) not in (WHITE_TO_MOVE, BLACK_TO_MOVE)
+            ):
+                failures += 1
+                continue
+
             x_batch.append(x_tokens)
-            y_board_batch.append(parsed["Y"].astype(np.int32))
+            y_board_batch.append(y_tokens)
             eval_value = float(parsed["eval"])
 
             # Stockfish score is side-to-move perspective. Convert to white perspective if configured.

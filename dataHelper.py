@@ -1,4 +1,5 @@
 import numpy as np
+import chess
 import base64
 
 def bytes_to_tokens(board_bytes: bytes) -> np.ndarray:
@@ -15,6 +16,102 @@ def bytes_to_tokens(board_bytes: bytes) -> np.ndarray:
     """
     return np.frombuffer(board_bytes, dtype=np.uint8)
 
+
+def tokens_to_board(tokens: np.ndarray) -> chess.Board:
+    """
+    Convert a numpy array of tokens back to a chess.Board object.
+    
+    Args:
+        tokens: numpy array of 65 integers (first is turn, rest are pieces)
+    
+    Returns:
+        chess.Board object representing the position
+    """
+    board = chess.Board.empty()
+    
+    # Set turn
+    if tokens[0] == WHITE_TO_MOVE:
+        board.turn = chess.WHITE
+    elif tokens[0] == BLACK_TO_MOVE:
+        board.turn = chess.BLACK
+    else:
+        raise ValueError("Invalid turn token")
+    
+    # Map tokens to pieces and set them on the board
+    for i in range(1, 65):
+        token = tokens[i]
+        if token == EMPTY_SQUARE:
+            continue
+        
+        piece_type = None
+        color = None
+        
+        if token in (WHITE_PAWN, BLACK_PAWN):
+            piece_type = chess.PAWN
+        elif token in (WHITE_KNIGHT, BLACK_KNIGHT):
+            piece_type = chess.KNIGHT
+        elif token in (WHITE_BISHOP, BLACK_BISHOP):
+            piece_type = chess.BISHOP
+        elif token in (WHITE_ROOK, BLACK_ROOK):
+            piece_type = chess.ROOK
+        elif token in (WHITE_QUEEN, BLACK_QUEEN):
+            piece_type = chess.QUEEN
+        elif token in (WHITE_KING, BLACK_KING):
+            piece_type = chess.KING
+        
+        if token <= WHITE_KING:
+            color = chess.WHITE
+        else:
+            color = chess.BLACK
+        
+        square_index = i - 1  # Adjust for turn byte at index 0
+        square = chess.SQUARES[square_index]
+        
+        board.set_piece_at(square, chess.Piece(piece_type, color))
+    
+    return board
+
+def board_to_tokens(board: chess.Board) -> np.ndarray:
+    """
+    Convert a chess.Board object to a numpy array of tokens.
+    
+    Args:
+        board: chess.Board object to convert
+    
+    Returns:
+        numpy array of 65 integers (first is turn, rest are pieces)
+    """
+    tokens = np.zeros(65, dtype=np.uint8)
+    
+    # Set turn token
+    tokens[0] = WHITE_TO_MOVE if board.turn == chess.WHITE else BLACK_TO_MOVE
+    
+    # Map pieces to tokens
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece is None:
+            continue
+        
+        piece_type = piece.piece_type
+        color = piece.color
+        
+        token = None
+        if piece_type == chess.PAWN:
+            token = WHITE_PAWN if color == chess.WHITE else BLACK_PAWN
+        elif piece_type == chess.KNIGHT:
+            token = WHITE_KNIGHT if color == chess.WHITE else BLACK_KNIGHT
+        elif piece_type == chess.BISHOP:
+            token = WHITE_BISHOP if color == chess.WHITE else BLACK_BISHOP
+        elif piece_type == chess.ROOK:
+            token = WHITE_ROOK if color == chess.WHITE else BLACK_ROOK
+        elif piece_type == chess.QUEEN:
+            token = WHITE_QUEEN if color == chess.WHITE else BLACK_QUEEN
+        elif piece_type == chess.KING:
+            token = WHITE_KING if color == chess.WHITE else BLACK_KING
+        
+        tokens[square + 1] = token  # +1 to account for turn byte at index 0
+    
+    return tokens
 
 def parse_board_response(response_data: dict) -> dict:
     """

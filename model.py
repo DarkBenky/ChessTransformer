@@ -12,6 +12,8 @@ cache = cachetools.LRUCache(maxsize=100_000)
 search_cache = cachetools.LRUCache(maxsize=500_000)
 model = None
 DEBUG_EVAL = False
+NEG_INF = float("-inf")
+POS_INF = float("inf")
 
 
 def _model_predict_batch(token_batch: np.ndarray) -> np.ndarray:
@@ -119,7 +121,7 @@ def _search_score(board: chess.Board, depth: int, alpha: float, beta: float, top
         return evalBoard(board)
 
     candidate_moves = _select_top_k_moves(board, legal_moves, top_k)
-    best_score = float("-inf")
+    best_score = NEG_INF
     for move in candidate_moves:
         board.push(move)
         score = -_search_score(board, depth - 1, -beta, -alpha, top_k)
@@ -145,10 +147,10 @@ def search(board: chess.Board, depth: int, return_move: bool = True, top_k: int 
         return None if return_move else evalBoard(board)
 
     candidate_moves = _select_top_k_moves(board, legal_moves, top_k)
-    alpha = float("-inf")
-    beta = float("inf")
+    alpha = NEG_INF
+    beta = POS_INF
     best_move = candidate_moves[0]
-    best_score = float("-inf")
+    best_score = NEG_INF
 
     for move in candidate_moves:
         board.push(move)
@@ -165,12 +167,11 @@ def search(board: chess.Board, depth: int, return_move: bool = True, top_k: int 
 
 def bestBoard(board: chess.Board, depth: int, top_k: int | None = None) -> tuple[chess.Board, float, float]:
     start = time.time()
-    search_cache.clear()
     best_move = search(board, depth, top_k=top_k)
     if best_move is None:
         return board, float(evalBoard(board)), time.time() - start  # No legal moves
     board.push(best_move)
-    best_score = -float(_search_score(board, depth - 1, float("-inf"), float("inf"), top_k))
+    best_score = -float(_search_score(board, depth - 1, NEG_INF, POS_INF, top_k))
     board.pop()
 
     board.push(best_move)

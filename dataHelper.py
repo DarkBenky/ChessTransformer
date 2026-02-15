@@ -177,8 +177,10 @@ def board_to_feature_planes(board: chess.Board) -> np.ndarray:
     white_board.turn = chess.WHITE
     black_board = board.copy(stack=False)
     black_board.turn = chess.BLACK
-    planes[:, :, 22] = min(1.0, len(list(white_board.legal_moves)) / 64.0)
-    planes[:, :, 23] = min(1.0, len(list(black_board.legal_moves)) / 64.0)
+    white_legal_moves = list(white_board.legal_moves)
+    black_legal_moves = list(black_board.legal_moves)
+    planes[:, :, 22] = min(1.0, len(white_legal_moves) / 64.0)
+    planes[:, :, 23] = min(1.0, len(black_legal_moves) / 64.0)
 
     piece_type_to_plane = {
         chess.PAWN: 24,
@@ -188,7 +190,7 @@ def board_to_feature_planes(board: chess.Board) -> np.ndarray:
         chess.QUEEN: 28,
         chess.KING: 29,
     }
-    for move in list(white_board.legal_moves) + list(black_board.legal_moves):
+    for move in white_legal_moves + black_legal_moves:
         piece = board.piece_at(move.from_square)
         if piece is None:
             continue
@@ -225,10 +227,12 @@ def board_to_feature_planes(board: chess.Board) -> np.ndarray:
     black_pawns = list(board.pieces(chess.PAWN, chess.BLACK))
     white_files = [chess.square_file(sq) for sq in white_pawns]
     black_files = [chess.square_file(sq) for sq in black_pawns]
+    white_file_set = set(white_files)
+    black_file_set = set(black_files)
     for sq in white_pawns:
         file_idx = chess.square_file(sq)
         rank_idx = chess.square_rank(sq)
-        if file_idx - 1 not in white_files and file_idx + 1 not in white_files:
+        if file_idx - 1 not in white_file_set and file_idx + 1 not in white_file_set:
             _set_plane_square(planes, 38, sq)
         if white_files.count(file_idx) > 1:
             _set_plane_square(planes, 40, sq)
@@ -243,7 +247,7 @@ def board_to_feature_planes(board: chess.Board) -> np.ndarray:
     for sq in black_pawns:
         file_idx = chess.square_file(sq)
         rank_idx = chess.square_rank(sq)
-        if file_idx - 1 not in black_files and file_idx + 1 not in black_files:
+        if file_idx - 1 not in black_file_set and file_idx + 1 not in black_file_set:
             _set_plane_square(planes, 39, sq)
         if black_files.count(file_idx) > 1:
             _set_plane_square(planes, 41, sq)
@@ -271,7 +275,8 @@ def board_to_feature_planes(board: chess.Board) -> np.ndarray:
         non_pawn_material += value * (
             len(board.pieces(piece_type, chess.WHITE)) + len(board.pieces(piece_type, chess.BLACK))
         )
-    planes[:, :, 47] = min(1.0, non_pawn_material / 62.0)
+    max_non_pawn_material = 62.0
+    planes[:, :, 47] = min(1.0, non_pawn_material / max_non_pawn_material)
 
     center = np.array([3.5, 3.5], dtype=np.float32)
     enemy_king_sq = board.king(not board.turn)
